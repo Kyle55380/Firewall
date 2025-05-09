@@ -1,29 +1,15 @@
+import argparse
+import os
+import sys
+import logging
+import subprocess
+import time
+import threading
+from dataclasses import dataclass
 from collections import defaultdict
 from scapy.all import sniff, IP, TCP
-import os
-import time
-import sys
-import subprocess
-import threading
 import ctypes
-import argparse
 
-# Command-line arguments for customization
-parser = argparse.ArgumentParser(description="Python Firewall")
-parser.add_argument("--log-dir", default="logs", help="Set log directory (default: logs)")
-parser.add_argument("--threshold", type=int, default=40, help="Packets per second limit before blocking")
-parser.add_argument("--block-duration", type=int, default=300, help="Seconds before an IP is unblocked")
-parser.add_argument("--no-unblock", action="store_true", help="Disable automatic unblocking")
-args = parser.parse_args()
-
-THRESHOLD = args.threshold  # Max allowed packets per second
-BLOCK_DURATION = args.block_duration  # Time in seconds before an IP is unblocked
-LOG_DIR = args.log_dir
-LOG_FILE = os.path.join(LOG_DIR, "network_monitor.log")
-
-# Ensure log directory exists
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
 
 def is_admin():
     try:
@@ -31,139 +17,193 @@ def is_admin():
     except:
         return False
 
+
 def check_admin_privileges():
-    if os.name != "posix" and not is_admin():
-        print("ERROR: This script requires Administrator privileges.")
-        sys.exit(1)
-    elif os.name == "posix" and os.geteuid() != 0:
+    if os.name == 'posix' and os.geteuid() != 0:
         print("ERROR: This script requires root privileges.")
         sys.exit(1)
+    elif os.name != 'posix' and not is_admin():
+        print("ERROR: This script requires Administrator privileges.")
+        sys.exit(1)
 
-check_admin_privileges()
 
-print(f"THRESHOLD: {THRESHOLD}, BLOCK_DURATION: {BLOCK_DURATION} seconds")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Network Traffic Firewall Monitor")
+    parser.add_argument("--log-dir", default="logs", help="Directory for log files")
+    parser.add_argument("--threshold", type=int, default=40, help="Packets/sec threshold for blocking")
+    parser.add_argument("--block-duration", type=int, default=300, help="Seconds before auto-unblock")
+    parser.add_argument("--no-unblock", action="store_true", help="Disable automatic unblocking")
+    return parser.parse_args()
 
-# Read IPs from a file
-def read_ip_file(filename):
-    if not os.path.exists(filename):
-        return set()
-    with open(filename, "r") as file:
-        return {line.strip() for line in file}
 
-# Check for Nimda worm signature
-def is_nimda_worm(packet):
-    if packet.haslayer(TCP) and packet[TCP].dport == 80:
-        payload = bytes(packet[TCP].payload).decode(errors='ignore')
-        return "GET /scripts/root.exe" in payload
-    return False
+def setup_logging(log_dir):
+    # ensure log folder exists
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "network_monitor.log")
+    # configure file logging
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger(__name__)
+    # add console handler for immediate feedback
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+    return logger
 
-# Log events to a file efficiently
-def log_event(message):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    with open(LOG_FILE, "a") as file:
-        file.write(f"[{timestamp}] {message}\n")
 
-# Check firewall status without exposing details
-def check_firewall_status():
-    while True:
-        time.sleep(60)
-        status_command = "sudo iptables -L -v -n" if os.name == "posix" else "netsh advfirewall show currentprofile"
-        result = subprocess.run(status_command, shell=True, capture_output=True, text=True)
-        if result.returncode == 0:
-            log_event("Firewall is active.")
-        else:
-            log_event("ERROR: Firewall may be disabled!")
+@dataclass
+class Config:
+    threshold: int
+    block_duration: int
+    no_unblock: bool
 
-def block_ip(ip, reason):
-    if ip in blocked_ips:
-        return  # Prevent redundant rules
-    
-    if os.name == "posix":
-        command = f"iptables -A INPUT -s {ip} -j DROP"
-    else:
-        command = f"netsh advfirewall firewall add rule name=Block_{ip} dir=in action=block remoteip={ip}"
-    
-    result = os.system(command)
-    if result == 0:
-        log_event(f"Blocking {ip} due to {reason}")
-        blocked_ips[ip] = time.time()
-    else:
-        log_event(f"ERROR: Failed to block {ip} with command: {command}")
-        print(f"ERROR: Failed to block {ip}. Check firewall settings.")
 
-def unblock_ips():
-    if args.no_unblock:
-        return  # Do nothing if unblocking is disabled
-    
-    while True:
-        time.sleep(60)
-        current_time = time.time()
-        to_unblock = [ip for ip, block_time in blocked_ips.items() if (current_time - block_time) >= BLOCK_DURATION]
+class FirewallMonitor:
+    def __init__(self, config, whitelist, blacklist, logger):
+        self.config = config
+        self.whitelist = whitelist
+        self.blacklist = blacklist
+        self.logger = logger
 
-        for ip in to_unblock:
-            if os.name == "posix":
-                os.system(f"iptables -D INPUT -s {ip} -j DROP")
+        self.packet_count = defaultdict(int)
+        self.blocked_ips = {}
+        self.count_lock = threading.Lock()
+        self.block_lock = threading.Lock()
+        self.last_reset = time.monotonic()
+        self.stop_event = threading.Event()
+
+    @staticmethod
+    def read_ip_file(filename):
+        if not os.path.exists(filename):
+            return set()
+        with open(filename) as f:
+            return {line.strip() for line in f if line.strip()}
+
+    @staticmethod
+    def is_nimda_worm(packet):
+        if packet.haslayer(TCP) and packet[TCP].dport == 80:
+            payload = bytes(packet[TCP].payload).decode(errors='ignore')
+            return "GET /scripts/root.exe" in payload
+        return False
+
+    def block_ip(self, ip, reason):
+        with self.block_lock:
+            if ip in self.blocked_ips:
+                return
+            if os.name == 'posix':
+                cmd = ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"]
             else:
-                os.system(f"netsh advfirewall firewall delete rule name=Block_{ip}")
-            
-            log_event(f"Unblocked {ip} after {BLOCK_DURATION} seconds")
-            del blocked_ips[ip]
+                cmd = [
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name=Block_{ip}", "dir=in", "action=block", f"remoteip={ip}"
+                ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info(f"Blocked {ip} due to {reason}")
+            else:
+                self.logger.error(f"Failed to block {ip}: {result.stderr.strip()}")
+            self.blocked_ips[ip] = time.monotonic()
 
-def packet_callback(packet):
-    if not packet.haslayer(IP):
-        return  # Ignore non-IP packets
+    def unblock_loop(self):
+        while not self.stop_event.wait(60):
+            if self.config.no_unblock:
+                continue
+            now = time.monotonic()
+            to_unblock = []
+            with self.block_lock:
+                for ip, t in list(self.blocked_ips.items()):
+                    if now - t >= self.config.block_duration:
+                        to_unblock.append(ip)
+            for ip in to_unblock:
+                if os.name == 'posix':
+                    cmd = ["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"]
+                else:
+                    cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name=Block_{ip}"]
+                subprocess.run(cmd, capture_output=True, text=True)
+                self.logger.info(f"Unblocked {ip} after {self.config.block_duration} seconds")
+                with self.block_lock:
+                    del self.blocked_ips[ip]
 
-    src_ip = packet[IP].src
+    def firewall_status_loop(self):
+        while not self.stop_event.wait(60):
+            if os.name == 'posix':
+                cmd = ["iptables", "-L", "-v", "-n"]
+            else:
+                cmd = ["netsh", "advfirewall", "show", "currentprofile"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info("Firewall is active.")
+            else:
+                self.logger.error("Firewall may be disabled!")
 
-    if src_ip in whitelist_ips:
-        return
+    def packet_callback(self, packet):
+        # initial debug print for first packet
+        if not hasattr(self, '_first_packet_logged'):
+            print("Monitoring: first packet received")
+            self.logger.info("First packet captured, entering monitoring loop")
+            self._first_packet_logged = True
 
-    if src_ip in blacklist_ips:
-        block_ip(src_ip, "blacklist entry")
-        return
-    
-    if is_nimda_worm(packet):
-        block_ip(src_ip, "Nimda worm detected")
-        return
+        if not packet.haslayer(IP):
+            return
+        src = packet[IP].src
+        if src in self.whitelist:
+            return
+        if src in self.blacklist:
+            self.block_ip(src, "blacklist entry")
+            return
+        if self.is_nimda_worm(packet):
+            self.block_ip(src, "Nimda worm detected")
+            return
 
-    packet_count[src_ip] += 1
-    current_time = time.time()
-    time_interval = current_time - start_time[0]
+        now = time.monotonic()
+        with self.count_lock:
+            self.packet_count[src] += 1
+        if now - self.last_reset >= 1:
+            with self.count_lock:
+                counts = dict(self.packet_count)
+                self.packet_count.clear()
+            for ip, count in counts.items():
+                rate = count / (now - self.last_reset)
+                if rate > self.config.threshold:
+                    self.block_ip(ip, f"high traffic ({rate:.2f} pkt/sec)")
+            self.last_reset = now
 
-    if time_interval >= 1:
-        to_remove = set()
-        for ip, count in packet_count.items():
-            packet_rate = count / time_interval
-            if packet_rate > THRESHOLD:
-                block_ip(ip, f"high traffic ({packet_rate:.2f} pkt/sec)")
-                to_remove.add(ip)
-        
-        for ip in to_remove:
-            packet_count.pop(ip, None)
+    def start(self):
+        print("Starting network monitor...")
+        self.logger.info("Starting network traffic monitoring")
+        threading.Thread(target=self.unblock_loop, daemon=True).start()
+        threading.Thread(target=self.firewall_status_loop, daemon=True).start()
+        sniff(filter="ip", prn=self.packet_callback, store=False)
 
-        start_time[0] = current_time
+    def shutdown(self):
+        self.stop_event.set()
+        self.logger.info("Shutdown signal received, stopping monitor")
+
+
+def main():
+    args = parse_args()
+    check_admin_privileges()
+    logger = setup_logging(args.log_dir)
+    logger.info("Logging initialized. Log file: %s", os.path.join(args.log_dir, "network_monitor.log"))
+    print(f"Logging initialized. Check console and {os.path.join(args.log_dir,'network_monitor.log')}")
+
+    config = Config(args.threshold, args.block_duration, args.no_unblock)
+    whitelist = FirewallMonitor.read_ip_file("whitelist.txt")
+    blacklist = FirewallMonitor.read_ip_file("blacklist.txt")
+
+    monitor = FirewallMonitor(config, whitelist, blacklist, logger)
+    try:
+        monitor.start()
+    except KeyboardInterrupt:
+        monitor.shutdown()
+        print("Network monitor stopped by user")
+
 
 if __name__ == "__main__":
-    whitelist_ips = read_ip_file("whitelist.txt")
-    blacklist_ips = read_ip_file("blacklist.txt")
-
-    packet_count = defaultdict(int)
-    start_time = [time.time()]
-    blocked_ips = {}
-
-    print("Monitoring network traffic...")
-    log_event("Started monitoring network traffic")
-
-    unblock_thread = threading.Thread(target=unblock_ips, daemon=True)
-    unblock_thread.start()
-
-    firewall_status_thread = threading.Thread(target=check_firewall_status, daemon=True)
-    firewall_status_thread.start()
-
-    try:
-        sniff(filter="ip", prn=packet_callback, store=False)
-    except KeyboardInterrupt:
-        print("\nStopping network monitor...")
-        log_event("Network monitor stopped by user")
-    except Exception as e:
-        log_event(f"Error occurred: {str(e)}")
+    main()
