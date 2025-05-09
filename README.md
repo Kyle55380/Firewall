@@ -10,6 +10,7 @@ This is a Python-based firewall that monitors network traffic, detects high-traf
 ✅ **Automatically unblocks IPs after a set duration**  
 ✅ **Customizable logging, thresholds, and blocking rules**  
 ✅ **Command-line options for better control**  
+✅ **GUI for visuals on what is going on with a quiz button**  
 
 ---
 
